@@ -37,17 +37,18 @@ class XiaowoEntity(Entity):
                 'option_key': option_key,
                 'option_value': option_value
             }
-            async with aiohttp.ClientSession() as session:
-                async with session.put(_device_info_url, data=data, headers=headers) as response:
-                    json_data = await response.json()
-                    if json_data is not None:
-                        message_code = json_data["message_code"]
-                        if message_code == 0:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as session:
+                async with session.put(_device_info_url, json=data, headers=headers) as response:
+                    if response.status == 200:
+                        json_data = await response.json()
+                        if json_data.get("message_code") == 0:
                             return True
                         else:
-                            LOGGER.error("json_data: %s", str(json_data["message_info"]))
+                            LOGGER.error("Device command failed: %s", json_data.get("message_info"))
                     else:
-                        LOGGER.error("请求失败！")
-        except(asyncio.TimeoutError, aiohttp.ClientError):
-            LOGGER.error("Error while accessing: %s", _device_info_url)
+                        LOGGER.error("HTTP error: %d - %s", response.status, await response.text())
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            LOGGER.error("Error while accessing: %s, %s", _device_info_url, str(e))
         return False
