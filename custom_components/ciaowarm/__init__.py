@@ -27,29 +27,49 @@ GATEWAY_PLATFORMS = [
 WEATHER_TIME_BETWEEN_UPDATES = timedelta(seconds=20)
 
 
-async def async_setup_entry(hass, entry):
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up Xiaowo integration from a config entry."""
     hass.data.setdefault(DOMAIN, {})
-    phone = entry.data[CONF_PHONE]
-    access_token = entry.data[CONF_KEY]
-    _device_info_url = REQUEST_URL_PREFIX + "/ciaowarm/hass/v1/device/info?phone=" + phone
+    phone = entry.data.get(CONF_PHONE)
+    access_token = entry.data.get(CONF_KEY)
+
+    if not phone or not access_token:
+        LOGGER.error("Missing required configuration parameters.")
+        return False
+
+    _device_info_url = f"{REQUEST_URL_PREFIX}/ciaowarm/hass/v1/device/info?phone={phone}"
+
     try:
         device_registry = dr.async_get(hass)
         headers = {'token': access_token}
-        async with aiohttp.ClientSession(headers=headers) as session:
+        timeout = aiohttp.ClientTimeout(total=10)
+
+        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
             async with session.get(_device_info_url) as response:
-                json_data = await response.json()
-                message_code = json_data["message_code"]
-                message_info = json_data["message_info"]
-                if message_code != 0:
-                    LOGGER.error("Error interface return: %s", message_info)
+                if response.status != 200:
+                    LOGGER.error("HTTP error: %s - %s", response.status, await response.text())
+                    return False
+
+                try:
+                    json_data = await response.json()
+                except ValueError as e:
+                    LOGGER.error("Error parsing JSON response: %s", str(e))
+                    return False
+
+                if not json_data or "message_code" not in json_data or "message_info" not in json_data:
+                    LOGGER.error("Unexpected JSON structure: %s", json_data)
+                    return False
+
+                if json_data["message_code"] != 0:
+                    LOGGER.error("Error from API: %s", json_data["message_info"])
                     return False
 
                 device_list: list[XiaowoDevice] = []
-                for item in message_info:
+                for item in json_data["message_info"]:
                     gateway_id = item['gateway_id']
-                    for gatewayItem in item:
-                        if gatewayItem == "thermostats":
-                            thermostats = item[gatewayItem]
+                    for gateway_item in item:
+                        if gateway_item == "thermostats":
+                            thermostats = item[gateway_item]
                             for thermostat in thermostats:
                                 device_list.append(XiaowoThermostat(phone, access_token, gateway_id, thermostat))
                                 thermostat_id = "t" + str(thermostat["thermostat_id"])
@@ -58,10 +78,10 @@ async def async_setup_entry(hass, entry):
                                     identifiers={(DOMAIN, thermostat_id)},
                                     manufacturer="IWARM TECH CO., LTD.",
                                     name=thermostat["thermostat_name"],
-                                    model=f"thermostat",
+                                    model="thermostat",
                                 )
-                        if gatewayItem == "boilers":
-                            boilers = item[gatewayItem]
+                        elif gateway_item == "boilers":
+                            boilers = item[gateway_item]
                             for boiler in boilers:
                                 device_list.append(XiaowoBoiler(phone, access_token, gateway_id, boiler))
                                 boiler_id = "b" + str(boiler["boiler_id"])
@@ -70,10 +90,10 @@ async def async_setup_entry(hass, entry):
                                     identifiers={(DOMAIN, boiler_id)},
                                     manufacturer="IWARM TECH CO., LTD.",
                                     name="小沃壁挂炉",
-                                    model=f"boiler",
+                                    model="boiler",
                                 )
-                        if gatewayItem == "extBoiler":
-                            ext_boiler = item[gatewayItem]
+                        elif gateway_item == "extBoiler":
+                            ext_boiler = item[gateway_item]
                             device_list.append(XiaowoExtBoiler(phone, access_token, gateway_id, ext_boiler))
                             ext_boiler_id = "e" + str(gateway_id)
                             device_registry.async_get_or_create(
@@ -81,19 +101,21 @@ async def async_setup_entry(hass, entry):
                                 identifiers={(DOMAIN, ext_boiler_id)},
                                 manufacturer="IWARM TECH CO., LTD.",
                                 name="第三方壁挂炉",
-                                model=f"extBoiler",
+                                model="extBoiler",
                             )
 
+        # Store device data and set up periodic updates
         device_data = HomeAssistantXiaowoData(phone, access_token, device_list)
         await device_data.async_update(dt_util.now())
         async_track_time_interval(hass, device_data.async_update, WEATHER_TIME_BETWEEN_UPDATES)
         hass.data[DOMAIN][entry.entry_id] = device_data
 
+        # Set up platforms
         await hass.config_entries.async_forward_entry_setups(entry, GATEWAY_PLATFORMS)
         entry.async_on_unload(entry.add_update_listener(update_listener))
 
-    except(asyncio.TimeoutError, aiohttp.ClientError):
-        LOGGER.error("Error while accessing: %s", _device_info_url)
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        LOGGER.error("Error while accessing: %s, %s", _device_info_url, str(e))
         return False
 
     return True
@@ -110,42 +132,54 @@ class HomeAssistantXiaowoData:
     def __init__(self, phone, access_token, device_list):
         self._phone = phone
         self._access_token = access_token
-        self._device_info_url = REQUEST_URL_PREFIX + "/ciaowarm/hass/v1/device/info?phone=" + phone
+        self._device_info_url = f"{REQUEST_URL_PREFIX}/ciaowarm/hass/v1/device/info?phone={phone}"
         self._headers = {'token': access_token}
         self.device_list: list[XiaowoDevice] = device_list
 
     async def async_update(self, now):
-        async with aiohttp.ClientSession(headers=self._headers) as session:
-            async with session.get(self._device_info_url) as response:
-                json_data = await response.json()
-                message_code = json_data["message_code"]
-                message_info = json_data["message_info"]
-                if message_code != 0:
-                    LOGGER.error("Error interface return: %s", message_info)
-                    return False
-                for item in message_info:
-                    gateway_id = item['gateway_id']
-                    for gatewayItem in item:
-                        if gatewayItem == "thermostats":
-                            thermostats = item[gatewayItem]
-                            for thermostat in thermostats:
-                                if self.device_list:
+        """Fetch the latest data from the API."""
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with aiohttp.ClientSession(headers=self._headers, timeout=timeout) as session:
+                async with session.get(self._device_info_url) as response:
+                    if response.status != 200:
+                        LOGGER.error("HTTP error during update: %s - %s", response.status, await response.text())
+                        return False
+
+                    try:
+                        json_data = await response.json()
+                    except ValueError as e:
+                        LOGGER.error("Error parsing JSON response during update: %s", str(e))
+                        return False
+
+                    if not json_data or "message_code" not in json_data or "message_info" not in json_data:
+                        LOGGER.error("Unexpected JSON structure during update: %s", json_data)
+                        return False
+
+                    if json_data["message_code"] != 0:
+                        LOGGER.error("Error from API during update: %s", json_data["message_info"])
+                        return False
+
+                    # Update devices
+                    for item in json_data["message_info"]:
+                        gateway_id = item['gateway_id']
+                        for gateway_item in item:
+                            if gateway_item == "thermostats":
+                                thermostats = item[gateway_item]
+                                for thermostat in thermostats:
                                     for device in self.device_list:
-                                        if isinstance(device, XiaowoThermostat):
-                                            if device.thermostat_id == thermostat['thermostat_id']:
-                                                device.update(thermostat)
-                        if gatewayItem == "boilers":
-                            boilers = item[gatewayItem]
-                            for boiler in boilers:
-                                if self.device_list:
+                                        if isinstance(device, XiaowoThermostat) and device.thermostat_id == thermostat['thermostat_id']:
+                                            device.update(thermostat)
+                            elif gateway_item == "boilers":
+                                boilers = item[gateway_item]
+                                for boiler in boilers:
                                     for device in self.device_list:
-                                        if isinstance(device, XiaowoBoiler):
-                                            if device.boiler_id == boiler['boiler_id']:
-                                                device.update(boiler)
-                        if gatewayItem == "extBoiler":
-                            ext_boiler = item[gatewayItem]
-                            if self.device_list:
+                                        if isinstance(device, XiaowoBoiler) and device.boiler_id == boiler['boiler_id']:
+                                            device.update(boiler)
+                            elif gateway_item == "extBoiler":
+                                ext_boiler = item[gateway_item]
                                 for device in self.device_list:
-                                    if isinstance(device, XiaowoExtBoiler):
-                                        if device.gateway_id == gateway_id:
-                                            device.update(ext_boiler)
+                                    if isinstance(device, XiaowoExtBoiler) and device.gateway_id == gateway_id:
+                                        device.update(ext_boiler)
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            LOGGER.error("Error while updating devices: %s", str(e))
